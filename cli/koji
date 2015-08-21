@@ -38,6 +38,7 @@ import base64
 import errno
 import koji
 import koji.util
+import koji.plugin
 import fnmatch
 from koji.util import md5_constructor
 import logging
@@ -152,40 +153,6 @@ def get_options():
     parser.add_option("--help-commands", action="store_true", default=False, help=_("list commands"))
     (options, args) = parser.parse_args()
 
-    if options.help_commands:
-        list_commands()
-        sys.exit(0)
-    if not args:
-        list_commands()
-        sys.exit(0)
-
-    aliases = {
-        'cancel-task' : 'cancel',
-        'cxl' : 'cancel',
-        'list-commands' : 'help',
-        'move-pkg': 'move-build',
-        'move': 'move-build',
-        'latest-pkg': 'latest-build',
-        'tag-pkg': 'tag-build',
-        'tag': 'tag-build',
-        'untag-pkg': 'untag-build',
-        'untag': 'untag-build',
-    }
-    cmd = args[0]
-    cmd = aliases.get(cmd, cmd)
-    if cmd.lower() in greetings:
-        cmd = "moshimoshi"
-    cmd = cmd.replace('-', '_')
-    if globals().has_key('anon_handle_' + cmd):
-        if not options.force_auth:
-            options.noauth = True
-        cmd = 'anon_handle_' + cmd
-    elif globals().has_key('handle_' + cmd):
-        cmd = 'handle_' + cmd
-    else:
-        list_commands()
-        parser.error('Unknown command: %s' % args[0])
-        assert False
     # load local config
     defaults = {
         'server' : 'http://localhost/kojihub',
@@ -206,6 +173,8 @@ def get_options():
         'cert': '~/.koji/client.crt',
         'ca': '~/.koji/clientca.crt',
         'serverca': '~/.koji/serverca.crt',
+        'plugin_path': None,
+        'plugins': None,
         'authtype': None
         }
     #note: later config files override earlier ones
@@ -281,6 +250,59 @@ def get_options():
                 options.topurl = suggest
             else:
                 warn("Warning: The pkgurl option is obsolete, please use topurl instead")
+
+
+    if options.plugins:
+        tracker = koji.plugin.PluginTracker(path=options.plugin_path.split(':'))
+        for name in options.plugins.split():
+            try:
+                tracker.load(name)
+                for v in vars(tracker.plugins[name]).itervalues():
+                    if callable(v):
+                        if getattr(v, 'exported', False):
+                            if hasattr(v, 'export_alias'):
+                                name = getattr(v, 'export_alias')
+                            else:
+                                name = v.__name__
+                            globals()[name] = v
+            except Exception:
+                error(''.join(traceback.format_exception(*sys.exc_info())))
+
+
+    if options.help_commands:
+        list_commands()
+        sys.exit(0)
+    if not args:
+        list_commands()
+        sys.exit(0)
+
+    aliases = {
+        'cancel-task' : 'cancel',
+        'cxl' : 'cancel',
+        'list-commands' : 'help',
+        'move-pkg': 'move-build',
+        'move': 'move-build',
+        'latest-pkg': 'latest-build',
+        'tag-pkg': 'tag-build',
+        'tag': 'tag-build',
+        'untag-pkg': 'untag-build',
+        'untag': 'untag-build',
+    }
+    cmd = args[0]
+    cmd = aliases.get(cmd, cmd)
+    if cmd.lower() in greetings:
+        cmd = "moshimoshi"
+    cmd = cmd.replace('-', '_')
+    if globals().has_key('anon_handle_' + cmd):
+        if not options.force_auth:
+            options.noauth = True
+        cmd = 'anon_handle_' + cmd
+    elif globals().has_key('handle_' + cmd):
+        cmd = 'handle_' + cmd
+    else:
+        list_commands()
+        parser.error('Unknown command: %s' % args[0])
+        assert False
 
     return options, cmd, args[1:]
 
