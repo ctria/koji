@@ -257,6 +257,7 @@ def get_options():
         for name in options.plugins.split():
             try:
                 tracker.load(name)
+                tracker.plugins[name].options = options
                 for v in vars(tracker.plugins[name]).itervalues():
                     if callable(v):
                         if getattr(v, 'exported', False):
