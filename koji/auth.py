@@ -27,7 +27,11 @@ import krbV
 import koji
 import cgi      #for parse_qs
 from context import context
-import pam
+try:
+    import pam
+except ImportError:  # pragma: no cover
+    pam = None
+
 
 # 1 - load session if provided
 #       - check uri for session id
@@ -269,7 +273,7 @@ class Session(object):
                 hostip = socket.gethostbyname(socket.gethostname())
 
         # check passwd
-        if context.opts.get('PAMService'):
+        if context.opts.get('PAMService') and pam is not None:
             if not pam.authenticate(user,password,context.opts.get('PAMService')):
                 raise koji.AuthError, 'invalid username or password'
             cursor = context.cnx.cursor()

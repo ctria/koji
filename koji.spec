@@ -47,7 +47,6 @@ License: LGPLv2 and GPLv2
 Requires: httpd
 Requires: mod_wsgi
 Requires: postgresql-python
-Requires: python-pam
 Requires: %{name} = %{version}-%{release}
 
 %description hub
