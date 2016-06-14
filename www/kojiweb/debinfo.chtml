@@ -1,0 +1,154 @@
+#import koji
+#from kojiweb import util
+#import time
+#import urllib
+
+#attr _PASSTHROUGH = ['debID', 'fileOrder', 'fileStart', 'buildrootOrder', 'buildrootStart']
+
+#include "includes/header.chtml"
+  <h4>Information for RPM <a href="debinfo?debID=$deb.id">$deb.name-$deb.version-$deb.release.${deb.arch}.deb</a></h4>
+
+  <table>
+    <tr>
+      <th>ID</th><td>$deb.id</td>
+    </tr>
+    <tr>
+      #if $build
+      <th>Name</th><td><a href="packageinfo?packageID=$build.package_id">$deb.name</a></td>
+      #else
+      <th>Name</th><td>$deb.name</td>
+      #end if
+    </tr>
+    <tr>
+      #if $build
+      <th>Version</th><td><a href="buildinfo?buildID=$build.id">$deb.version</a></td>
+      #else
+      <th>Version</th><td>$deb.version</td>
+      #end if
+    </tr>
+    <tr>
+      <th>Release</th><td>$deb.release</td>
+    </tr>
+    <tr>
+      <th>Arch</th><td>$deb.arch</td>
+    </tr>
+    #if $deb.external_repo_id == 0
+    <tr>
+      <th>Description</th><td class="debheader">$util.escapeHTML($description)</td>
+    </tr>
+    #end if
+    #if $build and $build.state == $koji.BUILD_STATES.DELETED
+    <tr>
+      <th>State</th><td class="deleted">deleted</td>
+    </tr>
+    #end if
+    #if $deb.external_repo_id
+    <tr>
+      <th>External Repository</th><td><a href="externalrepoinfo?extrepoID=$deb.external_repo_id">$deb.external_repo_name</a></td>
+    </tr>
+    #end if
+    <tr>
+      <th>Size</th><td>$deb.size</td>
+    </tr>
+    <tr>
+      <th>Payload Hash</th><td>$deb.payloadhash</td>
+    </tr>
+    #if $builtInRoot
+    <tr>
+      <th>Buildroot</th><td><a href="buildrootinfo?buildrootID=$builtInRoot.id">$builtInRoot.tag_name-$builtInRoot.id-$builtInRoot.repo_id</a></td>
+    </tr>
+    #end if
+    #if $deb.external_repo_id == 0
+    <tr>
+      <th>Depends</th>
+      <td class="container">
+        #if $len($Depends) > 0
+        <table class="nested">
+          #for $dep in $Depends
+          <tr>
+            <td>$dep.name</td>
+          </tr>
+          #end for
+        </table>
+        #else
+        No Depends
+        #end if
+      </td>
+    </tr>
+    <tr>
+      <th>Recommends</th>
+      <td class="container">
+        #if $len($Recommends) > 0
+        <table class="nested">
+          #for $dep in $Recommends
+          <tr>
+            <td>$dep.name</td>
+          </tr>
+          #end for
+        </table>
+        #else
+        No Recommends
+        #end if
+      </td>
+    </tr>
+    <tr>
+      <th>Suggests</th>
+      <td class="container">
+        #if $len($Suggests) > 0
+        <table class="nested">
+          #for $dep in $Suggests
+          <tr>
+            <td>$dep.name</td>
+          </tr>
+          #end for
+        </table>
+        #else
+        No Suggests
+        #end if
+      </td>
+    </tr>
+    <tr>
+      <th id="filelist">Files</th>
+      <td class="container">
+        #if $len($files) > 0
+        <table class="nested data-list">
+          <tr>
+            <td class="paginate" colspan="2">
+              #if $len($filePages) > 1
+              <form class="pageJump" action="">
+                Page:
+                <select onchange="javascript: window.location = 'debinfo?fileStart=' + this.value * $fileRange + '$util.passthrough_except($self, 'fileStart')#filelist';">
+                  #for $pageNum in $filePages
+                  <option value="$pageNum"#if $pageNum == $fileCurrentPage then ' selected="selected"' else ''#>#echo $pageNum + 1#</option>
+                  #end for
+                </select>
+              </form>
+              #end if
+              #if $fileStart > 0
+              <a href="debinfo?fileStart=#echo $fileStart - $fileRange #$util.passthrough_except($self, 'fileStart')#filelist">&lt;&lt;&lt;</a>
+              #end if
+              <strong>#echo $fileStart + 1 # through #echo $fileStart + $fileCount # of $totalFiles</strong>
+              #if $fileStart + $fileCount < $totalFiles
+              <a href="debinfo?fileStart=#echo $fileStart + $fileRange#$util.passthrough_except($self, 'fileStart')#filelist">&gt;&gt;&gt;</a>
+              #end if
+            </td>
+          </tr>
+          <tr class="list-header">
+            <th><a href="debinfo?fileOrder=$util.toggleOrder($self, 'name', 'fileOrder')$util.passthrough_except($self, 'fileOrder', 'fileStart')#filelist">Name</a> $util.sortImage($self, 'name', 'fileOrder')</th>
+            <th><a href="debinfo?fileOrder=$util.toggleOrder($self, 'size', 'fileOrder')$util.passthrough_except($self, 'fileOrder', 'fileStart')#filelist">Size</a> $util.sortImage($self, 'size', 'fileOrder')</th>
+          </tr>
+          #for $file in $files
+          <tr class="$util.rowToggle($self)">
+            <td><a href="fileinfo?debID=$deb.id&amp;filename=$urllib.quote($file.name)">$util.escapeHTML($file.name)</a></td><td>$file.size</td>
+          </tr>
+          #end for
+        </table>
+        #else
+        No Files
+        #end if
+      </td>
+    </tr>
+    #end if
+  </table>
+
+#include "includes/footer.chtml"
