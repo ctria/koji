@@ -144,6 +144,43 @@
         #end if
       </td>
     </tr>
+    <tr>
+      <th>DEBs</th>
+      <td class="container">
+        #if $len($debsByArch) > 0
+        <table class="nested">
+          #set $arches = $debsByArch.keys()
+          #silent $arches.sort()
+          #for $arch in $arches
+          <tr>
+            <th>$arch</th>
+            <td>
+              #if $task
+              #if $arch == 'noarch'
+              (<a href="$nvrpath/data/logs/$noarch_log_dest/">build logs</a>)
+              #else
+              (<a href="$nvrpath/data/logs/$arch/">build logs</a>)
+              #end if
+              #end if
+            </td>
+          </tr>
+          #for $deb in $debsByArch[$arch]
+          <tr>
+            #set $debfile = '%(name)s_%(version)s-%(release)s_%(arch)s.deb' % $deb
+            #set $debpath = $pathinfo.deb($deb)
+            <td></td>
+            <td>
+              $debfile (<a href="debinfo?debID=$deb.id">info</a>) (<a href="$nvrpath/$debpath">download</a>)
+            </td>
+          </tr>
+          #end for
+          #end for
+        </table>
+        #else
+        No DEBs
+        #end if
+      </td>
+    </tr>
     #if $archives
     <tr>
       <th>Archives</th>

@@ -1515,6 +1515,10 @@ class PathInfo(object):
         """Return the directory where the image for the build are stored"""
         return self.build(build) + '/images'
 
+    def deb(self,debinfo):
+        """Return the path (relative to build_dir) where a deb belongs"""
+        return "%(arch)s/%(name)s_%(version)s-%(release)s_%(arch)s.deb" % debinfo
+
     def rpm(self,rpminfo):
         """Return the path (relative to build_dir) where an rpm belongs"""
         return "%(arch)s/%(name)s-%(version)s-%(release)s.%(arch)s.rpm" % rpminfo

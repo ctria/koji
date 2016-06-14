@@ -57,6 +57,10 @@ import yum.comps
 import optparse
 #for import-comps handler (currently disabled)
 #from rhpl.comps import Comps
+try:
+    from debian.debfile import DebFile
+except ImportError:
+    pass
 
 # fix OptionParser for python 2.3 (optparse verion 1.4.1+)
 # code taken from optparse version 1.5a2
@@ -1635,6 +1639,113 @@ def handle_import(options, session, args):
             do_import(path, data)
 
 
+def handle_import_deb(options, session, args):
+    "[admin] Import externally built DEBs into the database"
+    if 'debian.debfile' not in sys.modules:
+        raise koji.GenericError, "The 'debian' python module is missing"
+    usage = _("usage: %prog import_deb [options] package [package...]")
+    usage += _("\n(Specify the --help global option for a list of other help options)")
+    parser = OptionParser(usage=usage)
+    parser.add_option("--link", action="store_true", help=_("Attempt to hardlink instead of uploading"))
+    parser.add_option("--test", action="store_true", help=_("Don't actually import"))
+    parser.add_option("--create-build", action="store_true", help=_("Auto-create builds as needed"))
+    (options, args) = parser.parse_args(args)
+    if len(args) < 1:
+        parser.error(_("At least one package must be specified"))
+        assert False
+    activate_session(session)
+    to_import = {}
+    for path in args:
+        debfile_control = DebFile(path).control.debcontrol()
+        debinfo = {}
+        debinfo['name'] = str(debfile_control['Package'])
+        debinfo['source'] = str(debfile_control['Source'])
+        debinfo['version'], debinfo['release'] = str(debfile_control['Version']).split('-')
+        debinfo['arch'] = str(debfile_control['Architecture'])
+
+        nvr = "%(source)s-%(version)s-%(release)s" % debinfo
+        to_import.setdefault(nvr,[]).append((path,debinfo))
+    builds_missing = False
+    nvrs = to_import.keys()
+    nvrs.sort()
+    for nvr in nvrs:
+        to_import[nvr].sort()
+        binfo = session.getBuild(nvr)
+        if not binfo:
+            print _("Missing build: %s") % nvr
+            builds_missing = True
+    if builds_missing and not options.create_build:
+        print _("Aborting import")
+        return
+
+    #local function to help us out below
+    def do_import(path, data):
+        rinfo = dict([(k,data[k]) for k in ('name','version','release','arch')])
+        prev = session.getDEB(rinfo)
+        if options.test:
+            print _("Test mode -- skipping import for %s") % path
+            return
+        serverdir = _unique_path('cli-import')
+        if options.link:
+            linked_upload(path, serverdir)
+        else:
+            print _("uploading %s...") % path,
+            sys.stdout.flush()
+            session.uploadWrapper(path, serverdir)
+            print _("done")
+            sys.stdout.flush()
+        print _("importing %s...") % path,
+        sys.stdout.flush()
+        try:
+            session.importDEB(serverdir, os.path.basename(path))
+        except koji.GenericError, e:
+            print _("\nError importing: %s" % str(e).splitlines()[-1])
+            sys.stdout.flush()
+        else:
+            print _("done")
+        sys.stdout.flush()
+
+    for nvr in nvrs:
+        # check for existing build
+        need_build = True
+        binfo = session.getBuild(nvr)
+        if binfo:
+            b_state = koji.BUILD_STATES[binfo['state']]
+            if b_state == 'COMPLETE':
+                need_build = False
+            elif b_state in ['FAILED', 'CANCELED']:
+                if not options.create_build:
+                    print _("Build %s state is %s. Skipping import") % (nvr, b_state)
+                    continue
+            else:
+                print _("Build %s exists with state=%s. Skipping import") % (nvr, b_state)
+                continue
+
+        if need_build:
+            if not options.create_build:
+                if binfo:
+                    # should have caught this earlier, but just in case...
+                    b_state = koji.BUILD_STATES[binfo['state']]
+                    print _("Build %s state is %s. Skipping import") % (nvr, b_state)
+                    continue
+                else:
+                    print _("No such build: %s (use --create-build option to add it)") % nvr
+                    continue
+            else:
+                # let's make a new build
+                b_data = koji.parse_NVR(nvr)
+                b_data['epoch'] = None
+                if options.test:
+                    print _("Test mode -- would have created empty build: %s") % nvr
+                else:
+                    print _("Creating empty build: %s") % nvr
+                    session.createEmptyBuild(**b_data)
+                    binfo = session.getBuild(nvr)
+
+        for path, data in to_import[nvr]:
+            do_import(path, data)
+
+
 def handle_import_comps(options, session, args):
     "Import group/package information from a comps file"
     usage = _("usage: %prog import-comps [options] <file> <tag>")
@@ -2582,6 +2693,7 @@ def anon_handle_list_tagged(options, session, args):
     parser = OptionParser(usage=usage)
     parser.add_option("--arch", help=_("List rpms for this arch"))
     parser.add_option("--rpms", action="store_true", help=_("Show rpms instead of builds"))
+    parser.add_option("--debs", action="store_true", help=_("Show debs instead of builds"))
     parser.add_option("--inherit", action="store_true", help=_("Follow inheritance"))
     parser.add_option("--latest", action="store_true", help=_("Only show the latest builds/rpms"))
     parser.add_option("--latest-n", type='int', metavar="N", help=_("Only show the latest N builds/rpms"))
@@ -2647,6 +2759,19 @@ def anon_handle_list_tagged(options, session, args):
             fmt = "%(name)s-%(version)s-%(release)s.%(arch)s"
             if options.sigs:
                 fmt = "%(sigkey)s " + fmt
+    elif options.debs:
+        debs, builds = session.listTaggedDEBS(tag, **opts)
+        data = debs
+        if options.paths:
+            build_idx = dict([(b['id'],b) for b in builds])
+            for rinfo in data:
+                build = build_idx[rinfo['build_id']]
+                builddir = pathinfo.build(build)
+                rinfo['path'] = os.path.join(builddir, pathinfo.deb(rinfo))
+            fmt = "%(path)s"
+            data = [x for x in data if x.has_key('path')]
+        else:
+            fmt = "%(name)s_%(version)s-%(release)s_%(arch)s"
     else:
         data = session.listTagged(tag, **opts)
         if options.paths:

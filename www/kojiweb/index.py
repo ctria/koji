@@ -1101,6 +1101,8 @@ def buildinfo(environ, buildID):
     tags.sort(_sortbyname)
     rpms = server.listBuildRPMs(build['id'])
     rpms.sort(_sortbyname)
+    debs = server.listBuildDEBs(build['id'])
+    debs.sort(_sortbyname)
     mavenbuild = server.getMavenBuild(buildID)
     winbuild = server.getWinBuild(buildID)
     imagebuild = server.getImageBuild(buildID)
@@ -1118,6 +1120,7 @@ def buildinfo(environ, buildID):
         archivesByExt.setdefault(os.path.splitext(archive['filename'])[1][1:], []).append(archive)
 
     rpmsByArch = {}
+    debsByArch = {}
     debuginfos = []
     for rpm in rpms:
         if koji.is_debuginfo(rpm['name']):
@@ -1134,6 +1137,9 @@ def buildinfo(environ, buildID):
         values['summary'] = koji.fixEncoding(headers.get('summary'))
         values['description'] = koji.fixEncoding(headers.get('description'))
         values['changelog'] = server.getChangelogEntries(build['id'])
+
+    for deb in debs:
+        debsByArch.setdefault(deb['arch'], []).append(deb)
 
     noarch_log_dest = 'noarch'
     if build['task_id']:
@@ -1182,6 +1188,7 @@ def buildinfo(environ, buildID):
     values['build'] = build
     values['tags'] = tags
     values['rpmsByArch'] = rpmsByArch
+    values['debsByArch'] = debsByArch
     values['task'] = task
     values['mavenbuild'] = mavenbuild
     values['winbuild'] = winbuild
@@ -1338,6 +1345,38 @@ def userinfo(environ, userID, packageOrder='package_name', packageStart=None, bu
 
     return _genHTML(environ, 'userinfo.chtml')
 
+def debinfo(environ, debID, fileOrder='name', fileStart=None, buildrootOrder='-id', buildrootStart=None):
+    values = _initValues(environ, 'DEB Info', 'builds')
+    server = _getServer(environ)
+
+    debID = int(debID)
+    deb = server.getDEB(debID)
+
+    values['title'] = '%(name)s-%(version)s-%(release)s.%(arch)s.deb' % deb + ' | DEB Info'
+
+    build = None
+    if deb['build_id'] != None:
+        build = server.getBuild(deb['build_id'])
+    builtInRoot = None
+    if deb['buildroot_id'] != None:
+        builtInRoot = server.getBuildroot(deb['buildroot_id'])
+    if deb['external_repo_id'] == 0:
+        for dep_type in ['Depends', 'Recommends', 'Suggests', 'Pre-Depends', 'Build-Depends', 'Build-Depends-Indep']:
+            values[dep_type] = server.getDEBDeps(deb['id'], dep_type)
+            values[dep_type].sort(_sortbyname)
+        headers = server.getDEBHeaders(deb['id'], headers=['Description'])
+        values['description'] = koji.fixEncoding(headers.get('Description'))
+
+    values['debID'] = debID
+    values['deb'] = deb
+    values['build'] = build
+    values['builtInRoot'] = builtInRoot
+
+    files = kojiweb.util.paginateMethod(server, values, 'listDEBFiles', args=[deb['id']],
+                                        start=fileStart, dataName='files', prefix='file', order=fileOrder)
+
+    return _genHTML(environ, 'debinfo.chtml')
+
 def rpminfo(environ, rpmID, fileOrder='name', fileStart=None, buildrootOrder='-id', buildrootStart=None):
     values = _initValues(environ, 'RPM Info', 'builds')
     server = _getServer(environ)
@@ -1420,12 +1459,13 @@ def archiveinfo(environ, archiveID, fileOrder='name', fileStart=None, buildrootO
 
     return _genHTML(environ, 'archiveinfo.chtml')
 
-def fileinfo(environ, filename, rpmID=None, archiveID=None):
+def fileinfo(environ, filename, rpmID=None, archiveID=None, debID=None):
     values = _initValues(environ, 'File Info', 'builds')
     server = _getServer(environ)
 
     values['rpm'] = None
     values['archive'] = None
+    values['deb'] = None
 
     if rpmID:
         rpmID = int(rpmID)
@@ -1445,8 +1485,17 @@ def fileinfo(environ, filename, rpmID=None, archiveID=None):
         if not file:
             raise koji.GenericError, 'no file %s in archive %i' % (filename, archiveID)
         values['archive'] = archive
+    elif debID:
+        debID = int(debID)
+        deb = server.getDEB(debID)
+        if not deb:
+            raise koji.GenericError, 'invalid DEB ID: %i' % debID
+        file = server.getDEBFile(deb['id'], filename)
+        if not file:
+            raise koji.GenericError, 'no file %s in DEB %i' % (filename, debID)
+        values['deb'] = deb
     else:
-        raise koji.GenericError, 'either rpmID or archiveID must be specified'
+        raise koji.GenericError, 'either rpmID, archiveID or debID must be specified'
 
     values['title'] = file['name'] + ' | File Info'
 
@@ -2181,6 +2230,20 @@ _infoURLs = {'package': 'packageinfo?packageID=%(id)i',
 _VALID_SEARCH_CHARS = r"""a-zA-Z0-9"""
 _VALID_SEARCH_SYMS = r""" @.,_/\()%+-*?|[]^$"""
 _VALID_SEARCH_RE = re.compile('^[' + _VALID_SEARCH_CHARS + re.escape(_VALID_SEARCH_SYMS) + ']+$')
+
+_DEFAULT_SEARCH_ORDER = {
+    # For searches against large tables, use '-id' to show most recent first
+    'build' : '-id',
+    'rpm' : '-id',
+    'deb' : '-id',
+    'maven' : '-id',
+    'win' : '-id',
+    # for other tables, ordering by name makes much more sense
+    'tag' : 'name',
+    'target' : 'name',
+    'package' : 'name',
+    # any type not listed will default to 'name'
+}
 
 def search(environ, start=None, order='name'):
     values = _initValues(environ, 'Search', 'search')

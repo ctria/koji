@@ -55,6 +55,10 @@ import types
 import xmlrpclib
 import zipfile
 from koji.context import context
+try:
+    from debian.debfile import DebFile
+except ImportError:
+    pass
 
 logger = logging.getLogger('koji.hub')
 
@@ -1222,6 +1226,90 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
             builds.append(build)
 
     return builds
+
+def readTaggedDEBS(tag, package=None, arch=None, event=None,inherit=False,latest=True,owner=None,type=None):
+    """Returns a list of dems for specified tag
+
+    set inherit=True to follow inheritance
+    set event to query at a time in the past
+    set latest=False to get all tagged DEBS (not just from the latest builds)
+    set latest=N to get only the N latest tagged DEBs
+
+    If type is not None, restrict the list to rpms from builds of the given type.  Currently the
+    supported types are 'maven' and 'win'.
+    """
+    taglist = [tag]
+    if inherit:
+        #XXX really should cache this - it gets called several places
+        #   (however, it is fairly quick)
+        taglist += [link['parent_id'] for link in readFullInheritance(tag, event)]
+
+    builds = readTaggedBuilds(tag, event=event, inherit=inherit, latest=latest, package=package, owner=owner, type=type)
+    #index builds
+    build_idx = dict([(b['build_id'],b) for b in builds])
+
+    #the following query is run for each tag in the inheritance
+    fields = [('debinfo.name', 'name'),
+              ('debinfo.version', 'version'),
+              ('debinfo.release', 'release'),
+              ('debinfo.arch', 'arch'),
+              ('debinfo.id', 'id'),
+              ('debinfo.size', 'size'),
+              ('debinfo.buildroot_id', 'buildroot_id'),
+              ('debinfo.build_id', 'build_id')]
+    tables = ['debinfo']
+    joins = ['tag_listing ON debinfo.build_id = tag_listing.build_id']
+    clauses = [eventCondition(event), 'tag_id=%(tagid)s']
+    data = {}  #tagid added later
+    if package:
+        joins.append('build ON debinfo.build_id = build.id')
+        joins.append('package ON package.id = build.pkg_id')
+        clauses.append('package.name = %(package)s')
+        data['package'] = package
+    if arch:
+        data['arch'] = arch
+        if isinstance(arch, basestring):
+            clauses.append('debinfo.arch = %(arch)s')
+        elif isinstance(arch, (list, tuple)):
+            clauses.append('debinfo.arch IN %(arch)s')
+        else:
+            raise koji.GenericError, 'invalid arch option: %s' % arch
+
+    fields, aliases = zip(*fields)
+    query = QueryProcessor(tables=tables, joins=joins, clauses=clauses,
+                           columns=fields, aliases=aliases, values=data)
+
+    # unique constraints ensure that each of these queries will not report
+    # duplicate debinfo entries, BUT since we make the query multiple times,
+    # we can get duplicates if a package is multiply tagged.
+    debs = []
+    tags_seen = {}
+    def _iter_debs():
+        for tagid in taglist:
+            if tags_seen.has_key(tagid):
+                #certain inheritance trees can (legitimately) have the same tag
+                #appear more than once (perhaps once with a package filter and once
+                #without). The hard part of that was already done by readTaggedBuilds.
+                #We only need consider each tag once. Note how we use build_idx below.
+                #(Without this, we could report the same rpm twice)
+                continue
+            else:
+                tags_seen[tagid] = 1
+            query.values['tagid'] = tagid
+            for debinfo in query.iterate():
+                #note: we're checking against the build list because
+                # it has been filtered by the package list. The tag
+                # tools should endeavor to keep tag_listing sane w.r.t.
+                # the package list, but if there is disagreement the package
+                # list should take priority
+                build = build_idx.get(debinfo['build_id'],None)
+                if build is None:
+                    continue
+                elif build['tag_id'] != tagid:
+                    #wrong tag
+                    continue
+                yield debinfo
+    return [_iter_debs(), builds]
 
 def readTaggedRPMS(tag, package=None, arch=None, event=None,inherit=False,latest=True,rpmsigs=False,owner=None,type=None):
     """Returns a list of rpms for specified tag
@@ -3335,6 +3423,100 @@ def get_next_release(build_info):
         raise koji.BuildError, 'Unable to increment release value: %s' % release
     return release
 
+
+def get_deb(debinfo, strict=False, multi=False):
+    """Get information about the specified DEB
+
+    debinfo may be any one of the following:
+    - a int ID
+    - a string N-V-R.A
+    - a string N-V-R.A@location
+    - a map containing 'name', 'version', 'release', and 'arch'
+      (and optionally 'location')
+
+    If specified, location should match the name of an external repo
+
+    A map will be returned, with the following keys:
+    - id
+    - name
+    - version
+    - release
+    - arch
+    - size
+    - build_id
+    - buildroot_id
+    - external_repo_id
+    - external_repo_name
+    - metadata_only
+    - extra
+
+    If there is no DEB with the given ID, None is returned, unless strict
+    is True in which case an exception is raised
+
+    If more than one DEB matches, and multi is True, then a list of results is
+    returned. If multi is False, a single match is returned (an internal one if
+    possible).
+    """
+    fields = (
+        ('debinfo.id', 'id'),
+        ('build_id', 'build_id'),
+        ('buildroot_id', 'buildroot_id'),
+        ('debinfo.name', 'name'),
+        ('version', 'version'),
+        ('release', 'release'),
+        ('arch', 'arch'),
+        ('external_repo_id', 'external_repo_id'),
+        ('external_repo.name', 'external_repo_name'),
+        ('size', 'size'),
+        ('metadata_only', 'metadata_only'),
+        ('extra', 'extra'),
+        )
+    # we can look up by id or NVRA
+    data = None
+    if isinstance(debinfo,(int,long)):
+        data = {'id': debinfo}
+    elif isinstance(debinfo,str):
+        data = koji.parse_NVRA(debinfo)
+    elif isinstance(debinfo,dict):
+        data = debinfo.copy()
+    else:
+        raise koji.GenericError, "Invalid argument: %r" % debinfo
+    clauses = []
+    if data.has_key('id'):
+        clauses.append("debinfo.id=%(id)s")
+    else:
+        clauses.append("""debinfo.name=%(name)s AND version=%(version)s
+        AND release=%(release)s AND arch=%(arch)s""")
+    retry = False
+    if data.has_key('location'):
+        data['external_repo_id'] = get_external_repo_id(data['location'], strict=True)
+        clauses.append("""external_repo_id = %(external_repo_id)i""")
+    elif not multi:
+        #try to match internal first, otherwise first matching external
+        retry = True  #if no internal match
+        orig_clauses = list(clauses)  #copy
+        clauses.append("""external_repo_id = 0""")
+
+    joins = ['external_repo ON debinfo.external_repo_id = external_repo.id']
+
+    query = QueryProcessor(columns=[f[0] for f in fields], aliases=[f[1] for f in fields],
+                           tables=['debinfo'], joins=joins, clauses=clauses,
+                           values=data)
+    if multi:
+        return query.execute()
+    ret = query.executeOne()
+    if ret:
+        return ret
+    if retry:
+        #at this point we have just an NVRA with no internal match. Open it up to externals
+        query.clauses = orig_clauses
+        ret = query.executeOne()
+    if not ret:
+        if strict:
+            raise koji.GenericError, "No such deb: %r" % data
+        return None
+    return ret
+
 def get_rpm(rpminfo, strict=False, multi=False):
     """Get information about the specified RPM
 
@@ -3434,6 +3616,77 @@ def get_rpm(rpminfo, strict=False, multi=False):
         return None
     ret['size'] = koji.encode_int(ret['size'])
     return ret
+
+def list_debs(buildID=None, buildrootID=None, imageID=None, hostID=None, arches=None, queryOpts=None):
+    """List DEBS.  If buildID, imageID and/or buildrootID are specified,
+    restrict the list of RPMs to only those RPMs that are part of that
+    build, or were built in that buildroot.  If componentBuildrootID is specified,
+    restrict the list to only those RPMs that will get pulled into that buildroot
+    when it is used to build another package.  A list of maps is returned, each map
+    containing the following keys:
+    - id
+    - name
+    - version
+    - release
+    - nvr (synthesized for sorting purposes)
+    - arch
+    - size
+    - build_id
+    - buildroot_id
+    - external_repo_id
+    - external_repo_name
+    - metadata_only
+    - extra
+    If no build has the given ID, or the build generated no RPMs,
+    an empty list is returned."""
+    fields = [('debinfo.id', 'id'), ('debinfo.name', 'name'), ('debinfo.version', 'version'),
+              ('debinfo.release', 'release'),
+              ("debinfo.name || '-' || debinfo.version || '-' || debinfo.release", 'nvr'),
+              ('debinfo.arch', 'arch'),
+              ('debinfo.size', 'size'),
+              ('debinfo.build_id', 'build_id'), ('debinfo.buildroot_id', 'buildroot_id'),
+              ('debinfo.external_repo_id', 'external_repo_id'),
+              ('external_repo.name', 'external_repo_name'),
+              ('debinfo.metadata_only', 'metadata_only'),
+              ('debinfo.extra', 'extra'),
+             ]
+    joins = ['external_repo ON debinfo.external_repo_id = external_repo.id']
+    clauses = []
+
+    if buildID != None:
+        clauses.append('debinfo.build_id = %(buildID)i')
+    if buildrootID != None:
+        clauses.append('debinfo.buildroot_id = %(buildrootID)i')
+
+    # image specific constraints
+    if imageID != None:
+        clauses.append('image_listing.image_id = %(imageID)i')
+        joins.append('image_listing ON debinfo.id = image_listing.deb_id')
+
+    if hostID != None:
+        joins.append('standard_buildroot ON debinfo.buildroot_id = standard_buildroot.buildroot_id')
+        clauses.append('standard_buildroot.host_id = %(hostID)i')
+    if arches != None:
+        if isinstance(arches, list) or isinstance(arches, tuple):
+            clauses.append('debinfo.arch IN %(arches)s')
+        elif isinstance(arches, str):
+            clauses.append('debinfo.arch = %(arches)s')
+        else:
+            raise koji.GenericError, 'invalid type for "arches" parameter: %s' % type(arches)
+
+    fields, aliases = zip(*fields)
+    query = QueryProcessor(columns=fields, aliases=aliases,
+                           tables=['debinfo'], joins=joins, clauses=clauses,
+                           values=locals(), opts=queryOpts)
+    data = query.execute()
+    if not (queryOpts and queryOpts.get('countOnly')):
+        if queryOpts and 'asList' in queryOpts:
+            key = aliases.index('size')
+        else:
+            key = 'size'
+        for row in data:
+            row[key] = koji.encode_int(row[key])
+    return data
 
 def list_rpms(buildID=None, buildrootID=None, imageID=None, componentBuildrootID=None, hostID=None, arches=None, queryOpts=None):
     """List RPMS.  If buildID, imageID and/or buildrootID are specified,
@@ -4523,6 +4776,66 @@ def import_build(srpm, rpms, brmap=None, task_id=None, build_id=None, logs=None)
                               task_id=task_id, build_id=build_id, build=binfo, logs=logs)
     return binfo
 
+
+def import_deb(fn, buildinfo=None, brootid=None, wrapper=False):
+    """Import a single deb into the database
+
+    Designed to be called from import_build_deb.
+    """
+    if 'debian.debfile' not in sys.modules:
+        raise koji.GenericError, "The 'debian' python module is missing on the hub"
+
+    if not os.path.exists(fn):
+        raise koji.GenericError, "no such file: %s" % fn
+
+    #read deb info
+    debfile_control = DebFile(fn).control.debcontrol()
+    debinfo = {}
+    debinfo['name'] = str(debfile_control['Package'])
+    debinfo['source'] = str(debfile_control['Source'])
+    debinfo['version'], debinfo['release'] = str(debfile_control['Version']).split('-')
+    debinfo['arch'] = str(debfile_control['Architecture'])
+
+    #sanity check basename
+    basename = os.path.basename(fn)
+    expected = "%(name)s_%(version)s-%(release)s_%(arch)s.deb" % debinfo
+    if basename != expected:
+        raise koji.GenericError, "bad filename: %s (expected %s)" % (basename,expected)
+
+    if buildinfo is None:
+        #figure it out from NVR
+        buildinfo = get_build("%(source)s-%(version)s-%(release)s" % debinfo)
+        if buildinfo is None:
+            #XXX - handle case where package is not a source rpm
+            #      and we still need to create a new build
+            raise koji.GenericError, 'No matching build'
+        state = koji.BUILD_STATES[buildinfo['state']]
+        if state in ('FAILED', 'CANCELED', 'DELETED'):
+            nvr = "%(name)s-%(version)s-%(release)s" % buildinfo
+            raise koji.GenericError, "Build is %s: %s" % (state, nvr)
+
+    #add debinfo entry
+    debinfo['id'] = _singleValue("""SELECT nextval('debinfo_id_seq')""")
+    debinfo['build_id'] = buildinfo['id']
+    debinfo['size'] = os.path.getsize(fn)
+    debinfo['buildroot_id'] = brootid
+    debinfo['external_repo_id'] = 0
+
+    koji.plugin.run_callbacks('preImport', type='deb', deb=debinfo, build=buildinfo,
+                              filepath=fn)
+
+    data = debinfo.copy()
+    insert = InsertProcessor('debinfo', data=data)
+    insert.execute()
+
+    koji.plugin.run_callbacks('postImport', type='deb', deb=debinfo, build=buildinfo,
+                              filepath=fn)
+
+    #extra fields for return
+    debinfo['build'] = buildinfo
+    debinfo['brootid'] = brootid
+    return debinfo
+
 def import_rpm(fn,buildinfo=None,brootid=None,wrapper=False):
     """Import a single rpm into the database
 
@@ -4678,6 +4991,14 @@ def import_build_log(fn, buildinfo, subdir=None):
         raise koji.GenericError("Error importing build log. %s is not a regular file." % fn)
     os.rename(fn,final_path)
     os.symlink(final_path,fn)
+
+def import_deb_file(fn,buildinfo,debinfo):
+    """Move the rpm file into the proper place
+
+    Generally this is done after the db import
+    """
+    final_path = "%s/%s" % (koji.pathinfo.build(buildinfo),koji.pathinfo.deb(debinfo))
+    _import_archive_file(fn, os.path.dirname(final_path))
 
 def import_rpm_file(fn,buildinfo,rpminfo):
     """Move the rpm file into the proper place
@@ -7802,6 +8123,21 @@ class RootExports(object):
             build = get_build(build_id, strict=True)
         new_image_build(build)
 
+    def importDEB(self, path, basename):
+        """Import an DEB into the database.
+
+        The file must be uploaded first.
+        """
+        context.session.assertPerm('admin')
+        uploadpath = koji.pathinfo.work()
+        fn = "%s/%s/%s" %(uploadpath,path,basename)
+        if not os.path.exists(fn):
+            raise koji.GenericError, "No such file: %s" % fn
+        debinfo = import_deb(fn)
+        import_deb_file(fn,debinfo['build'],debinfo)
+        for tag in list_tags(build=debinfo['build_id']):
+            set_tag_update(tag['id'], 'IMPORT')
+
     def importRPM(self, path, basename):
         """Import an RPM into the database.
 
@@ -8197,6 +8533,13 @@ class RootExports(object):
             results = [build for build in results if build['package_name'].lower().startswith(prefix)]
         return results
 
+    def listTaggedDEBS(self,tag,event=None,inherit=False,latest=False,package=None,arch=None,owner=None,type=None):
+        """List debs and builds within tag"""
+        if not isinstance(tag,int):
+            #lookup tag id
+            tag = get_tag_id(tag,strict=True)
+        return readTaggedDEBS(tag,event=event,inherit=inherit,latest=latest,package=package,arch=arch,owner=owner,type=type)
+
     def listTaggedRPMS(self,tag,event=None,inherit=False,latest=False,package=None,arch=None,rpmsigs=False,owner=None,type=None):
         """List rpms and builds within tag"""
         if not isinstance(tag,int):
@@ -8443,6 +8786,30 @@ class RootExports(object):
                 mapping[int(key)] = mapping[key]
         return readFullInheritance(tag,event,reverse,stops,jumps)
 
+    listDEBs = staticmethod(list_debs)
+
+    def listBuildDEBs(self,build):
+        """Get information about all the DEBs generated by the build with the given
+        ID.  A list of maps is returned, each map containing the following keys:
+
+        - id
+        - name
+        - version
+        - release
+        - arch
+        - epoch
+        - payloadhash
+        - size
+        - buildtime
+        - build_id
+        - buildroot_id
+
+        If no build has the given ID, or the build generated no DEBs, an empty list is returned."""
+        if not isinstance(build, int):
+            #lookup build id
+            build = self.findBuildID(build, strict=True)
+        return self.listDEBs(buildID=build)
+
     listRPMs = staticmethod(list_rpms)
 
     def listBuildRPMs(self,build):
@@ -8468,6 +8835,43 @@ class RootExports(object):
         return self.listRPMs(buildID=build)
 
     getRPM = staticmethod(get_rpm)
+
+    getDEB = staticmethod(get_deb)
+
+    def getDEBDeps(self, debID, depType=None, queryOpts=None):
+        """Return dependency information about the DEB with the given ID.
+        If depType is specified, restrict results to dependencies of the given type.
+        Otherwise, return all dependency information.  A list of maps will be returned,
+        each with the following keys:
+        - name
+        - type
+
+        If there is no DEB with the given ID, or the DEB has no dependency information,
+        an empty list will be returned.
+        """
+        if queryOpts is None:
+            queryOpts = {}
+        deb_info = get_deb(debID)
+        if not deb_info or not deb_info['build_id']:
+            return _applyQueryOpts([], queryOpts)
+        build_info = get_build(deb_info['build_id'])
+        deb_path = os.path.join(koji.pathinfo.build(build_info), koji.pathinfo.deb(deb_info))
+        if not os.path.exists(deb_path):
+            return _applyQueryOpts([], queryOpts)
+
+        results = []
+
+        for dep_name in ['Depends','Recommends','Suggests', 'Pre-Depends', 'Build-Depends', 'Build-Depends-Indep']:
+            if depType is None or depType.lower() == dep_name.lower():
+                debcontrol = DebFile(deb_path).debcontrol()
+                if dep_name in debcontrol:
+                    for name in debcontrol[dep_name].split(", "):
+                        if queryOpts.get('asList'):
+                            results.append([name, dep_name])
+                        else:
+                            results.append({'name': name, 'type': dep_name})
+
+        return _applyQueryOpts(results, queryOpts)
 
     def getRPMDeps(self, rpmID, depType=None, queryOpts=None):
         """Return dependency information about the RPM with the given ID.
@@ -8507,6 +8911,52 @@ class RootExports(object):
                         results.append([name, version, flags, dep_id])
                     else:
                         results.append({'name': name, 'version': version, 'flags': flags, 'type': dep_id})
+
+        return _applyQueryOpts(results, queryOpts)
+
+    def listDEBFiles(self, debID, queryOpts=None):
+        """List files associated with the DEB with the given ID.  A list of maps
+        will be returned, each with the following keys:
+        - name
+        - digest
+        - md5 (alias for digest)
+        - digest_algo
+        - size
+        - flags
+
+        If there is no DEB with the given ID, or that DEB contains no files,
+        an empty list will be returned."""
+
+        if 'debian.debfile' not in sys.modules:
+            raise koji.GenericError, "The 'debian' python module is missing on the hub"
+
+        if queryOpts is None:
+            queryOpts = {}
+        deb_info = get_deb(debID)
+        if not deb_info or not deb_info['build_id']:
+            return _applyQueryOpts([], queryOpts)
+        build_info = get_build(deb_info['build_id'])
+        deb_path = os.path.join(koji.pathinfo.build(build_info), koji.pathinfo.deb(deb_info))
+        if not os.path.exists(deb_path):
+            return _applyQueryOpts([], queryOpts)
+
+        results = []
+        digest_algo = 'md5' # DEB always uses MD5
+        flags = 0 # DEB files don't have flags
+
+        debfile = DebFile(deb_path)
+
+        for filename in debfile.md5sums().keys():
+            try:
+                data_member = debfile.data.tgz().getmember(filename)
+            except KeyError:
+                data_member = debfile.data.tgz().getmember('./' + filename)
+            if queryOpts.get('asList'):
+                results.append([filename, debfile.md5sums()[filename], data_member.size, flags, digest_algo, data_member.uname, data_member.gname, data_member.mtime, data_member.mode])
+            else:
+                results.append({'name': filename, 'digest': debfile.md5sums()[filename], 'digest_algo': digest_algo,
+                                'md5': debfile.md5sums()[filename], 'size': data_member.size, 'flags': flags,
+                                'user': data_member.uname, 'group': data_member.gname, 'mtime': data_member.mtime, 'mode': data_member.mode})
 
         return _applyQueryOpts(results, queryOpts)
 
@@ -8551,6 +9001,44 @@ class RootExports(object):
 
         return _applyQueryOpts(results, queryOpts)
 
+    def getDEBFile(self, debID, filename):
+        """
+        Get info about the file in the given DEB with the given filename.
+        A map will be returned with the following keys:
+        - deb_id
+        - name
+        - digest
+        - md5 (alias for digest)
+        - digest_algo
+        - size
+        - flags
+
+        If no such file exists, an empty map will be returned.
+        """
+        deb_info = get_deb(debID)
+        if not deb_info or not deb_info['build_id']:
+            return {}
+        build_info = get_build(deb_info['build_id'])
+        deb_path = os.path.join(koji.pathinfo.build(build_info), koji.pathinfo.deb(deb_info))
+        if not os.path.exists(deb_path):
+            return {}
+
+        digest_algo = 'md5' # DEB always uses MD5
+        flags = 0 # DEB files don't have flags
+
+        debfile = DebFile(deb_path)
+
+        if filename in debfile.md5sums().keys():
+            try:
+                data_member = debfile.data.tgz().getmember(filename)
+            except KeyError:
+                data_member = debfile.data.tgz().getmember('./' + filename)
+            return {'deb_id': deb_info['id'], 'name': filename, 'digest': debfile.md5sums()[filename],
+                    'digest_algo': digest_algo, 'md5': debfile.md5sums()[filename], 'size': data_member.size,
+                    'flags': flags, 'user': data_member.uname, 'group': data_member.gname,
+                    'mtime': data_member.mtime, 'mode': data_member.mode}
+        return {}
+
     def getRPMFile(self, rpmID, filename):
         """
         Get info about the file in the given RPM with the given filename.
@@ -8589,6 +9077,41 @@ class RootExports(object):
                         'mtime': fields['filemtimes'][i], 'mode': fields['filemodes'][i]}
             i += 1
         return {}
+
+    def getDEBHeaders(self, debID=None, taskID=None, filepath=None, headers=None):
+        """
+        Get the requested headers from the deb.  Header names are case-insensitive.
+        If a header is requested that does not exist an exception will be raised.
+        Returns a map of header names to values.  If the specified ID
+        is not valid or the deb does not exist on the file system, an empty map
+        will be returned.
+        """
+        if not headers:
+            headers = []
+        if debID:
+            deb_info = get_deb(debID)
+            if not deb_info or not deb_info['build_id']:
+                return {}
+            build_info = get_build(deb_info['build_id'])
+            deb_path = os.path.join(koji.pathinfo.build(build_info), koji.pathinfo.deb(deb_info))
+            if not os.path.exists(deb_path):
+                return {}
+        elif taskID:
+            if not filepath:
+                raise koji.GenericError, 'filepath must be specified with taskID'
+            if filepath.startswith('/') or '../' in filepath:
+                raise koji.GenericError, 'invalid filepath: %s' % filepath
+            deb_path = os.path.join(koji.pathinfo.work(),
+                                    koji.pathinfo.taskrelpath(taskID),
+                                    filepath)
+        else:
+            raise koji.GenericError, 'either debID or taskID and filepath must be specified'
+
+        debfile = DebFile(deb_path)
+        result = {}
+        for header in headers:
+            result[header] = koji.fixEncoding(debfile.debcontrol()[header])
+        return result
 
     def getRPMHeaders(self, rpmID=None, taskID=None, filepath=None, headers=None):
         """
